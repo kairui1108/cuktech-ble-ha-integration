@@ -1,0 +1,112 @@
+name: Sync from upstream
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */6 * * *'
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          token: ${{ secrets.PAT_TOKEN }}
+
+      - name: Fetch and extract upstream
+        run: |
+          git remote add upstream https://github.com/kairui1108/cuktech-ble-ha.git || true
+          git fetch upstream main
+          mkdir -p /tmp/upstream
+          git archive upstream/main | tar -x -C /tmp/upstream
+
+      - name: Check for changes
+        id: check
+        run: |
+          if git diff --quiet upstream/main -- ha_integration/ docs/integration-readme.md; then
+            echo "changed=false" >> $GITHUB_OUTPUT
+          else
+            echo "changed=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check version change
+        if: steps.check.outputs.changed == 'true'
+        id: version
+        run: |
+          UPSTREAM_VERSION=$(grep '"version"' /tmp/upstream/ha_integration/custom_components/cuktech_charger/manifest.json | sed 's/.*"version": *"\([^"]*\)".*/\1/')
+          CURRENT_VERSION=$(grep '"version"' custom_components/cuktech_charger/manifest.json 2>/dev/null | sed 's/.*"version": *"\([^"]*\)".*/\1/' || echo "0.0.0")
+          echo "upstream=$UPSTREAM_VERSION" >> $GITHUB_OUTPUT
+          echo "current=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+          if [ "$UPSTREAM_VERSION" != "$CURRENT_VERSION" ]; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Sync files
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          rsync -av --delete --exclude='.git' /tmp/upstream/ha_integration/custom_components/cuktech_charger/ custom_components/cuktech_charger/
+          cp /tmp/upstream/ha_integration/hacs.json hacs.json
+          cp /tmp/upstream/docs/integration-readme.md README.md
+          cp /tmp/upstream/docs/integration-readme-en.md README.en.md
+
+      - name: Sync release notes
+        run: |
+          cp /tmp/upstream/RELEASE_NOTES.md RELEASE_NOTES.md 2>/dev/null || true
+
+      - name: Extract release notes
+        if: steps.check.outputs.changed == 'true'
+        id: notes
+        run: |
+          VERSION="${{ steps.version.outputs.upstream }}"
+          if [ -f RELEASE_NOTES.md ]; then
+            NOTES=$(awk -v ver="${VERSION}" 'BEGIN{f=0} $0 ~ ("^##[[:space:]]v?" ver){f=1; next} f && $0 ~ "^##[[:space:]]" {exit} f{print}' RELEASE_NOTES.md)
+          fi
+          NOTES="${NOTES:-See commit history for changes.}"
+          {
+            echo "notes<<EOF"
+            echo "$NOTES"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .
+          if ! git diff --cached --quiet; then
+            VERSION="${{ steps.version.outputs.upstream }}"
+            git commit -m "Sync from upstream (v$VERSION)"
+            git push
+          fi
+
+      - name: Check if release exists
+        if: steps.check.outputs.changed == 'true'
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          VERSION="${{ steps.version.outputs.upstream }}"
+          if gh release view "v${VERSION}" > /dev/null 2>&1; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create release
+        if: steps.check.outputs.changed == 'true' && steps.release.outputs.exists == 'false'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: v${{ steps.version.outputs.upstream }}
+          name: v${{ steps.version.outputs.upstream }}
+          body: |
+            ## Changes
+
+            ${{ steps.notes.outputs.notes }}
+
+            ## Installation
+
+            1. Add this repository to HACS as a custom integration
+            2. Install "CUKTECH Charger"
+            3. Restart Home Assistant
+          token: ${{ secrets.PAT_TOKEN }}
