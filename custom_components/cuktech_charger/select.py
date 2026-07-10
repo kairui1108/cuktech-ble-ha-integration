@@ -10,15 +10,9 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from . import CuktechMQTTCoordinator
-from .const import DOMAIN, DEVICE_INFO, PIID_DISPLAY
+from .const import DOMAIN, DEVICE_INFO, PIID_DISPLAY, SELECT_PIIDS, SELECT_OPTION_MAP
 
 _LOGGER = logging.getLogger(__name__)
-
-SELECT_PIIDS = {
-    5: {"name": "场景模式", "icon": "mdi:cog", "options": ["AI模式", "数码生态", "单口模式", "均衡模式"]},
-    6: {"name": "息屏时间", "icon": "mdi:monitor", "options": ["5分钟", "1分钟", "10分钟", "30分钟", "常亮"]},
-    13: {"name": "语言", "icon": "mdi:translate", "options": ["English", "中文"]},
-}
 
 
 async def async_setup_entry(
@@ -60,6 +54,7 @@ class CuktechSelect(SelectEntity):
     async def async_will_remove_from_hass(self) -> None:
         """Unregister callback when removed."""
         self.coordinator.unregister_callback(self._update)
+        await super().async_will_remove_from_hass()
 
     @callback
     def _update(self) -> None:
@@ -80,16 +75,16 @@ class CuktechSelect(SelectEntity):
     @property
     def current_option(self) -> str | None:
         """Return the current option."""
-        if not self.coordinator.data:
+        if not self.coordinator._settings:
             return None
-        v = self.coordinator.data.get(str(self._piid))
+        v = self.coordinator._settings.get(str(self._piid))
         if v is None:
             return None
         return PIID_DISPLAY.get(self._piid, {}).get(v)
 
     async def async_select_option(self, option: str) -> None:
         """Select an option."""
-        display = PIID_DISPLAY.get(self._piid, {})
-        value = next((k for k, v in display.items() if v == option), None)
+        option_map = SELECT_OPTION_MAP.get(self._piid, {})
+        value = option_map.get(option)
         if value is not None:
             await self.coordinator.async_set_value(self._piid, value)

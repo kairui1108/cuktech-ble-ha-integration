@@ -64,6 +64,7 @@ class CuktechCountdown(NumberEntity):
     async def async_will_remove_from_hass(self) -> None:
         """Unregister callback when removed."""
         self.coordinator.unregister_callback(self._update)
+        await super().async_will_remove_from_hass()
 
     @callback
     def _update(self) -> None:
@@ -84,10 +85,15 @@ class CuktechCountdown(NumberEntity):
     @property
     def native_value(self) -> float | None:
         """Return the countdown value."""
-        if not self.coordinator.data:
+        if not self.coordinator._settings:
             return None
-        v = self.coordinator.data.get(str(self._piid))
-        return float(v) if v is not None else 0
+        v = self.coordinator._settings.get(str(self._piid))
+        if v is None:
+            return None
+        try:
+            return float(v)
+        except (ValueError, TypeError):
+            return None
 
     async def async_set_native_value(self, value: float) -> None:
         """Set the countdown value."""

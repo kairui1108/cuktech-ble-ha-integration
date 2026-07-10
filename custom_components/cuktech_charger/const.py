@@ -40,13 +40,30 @@ PIID_NAMES = {
 # PIID display values
 PIID_DISPLAY = {
     5: {1: "AI模式", 2: "数码生态", 3: "单口模式", 4: "均衡模式"},
-    6: {0: "5分钟", 1: "1分钟", 2: "10分钟", 3: "30分钟", 4: "常亮", 5: "1分钟"},
+    6: {0: "5分钟", 1: "1分钟", 2: "10分钟", 3: "30分钟", 4: "常亮", 5: "1分钟(设备固件: value=5 也表示1分钟)"},
     7: {0: "默认", 1: "QC2.0", 2: "QC3.0", 3: "QC4.0", 4: "FCP", 5: "SCP", 6: "AFC", 7: "PE", 8: "PD", 9: "SFCP", 10: "UFCS"},
     13: {0: "English", 1: "中文"},
     15: {0: "关闭", 1: "开启"},
     19: {0: "关闭", 1: "开启"},
     20: {0: "关闭", 1: "开启"},
 }
+
+# Select options for each setting
+SELECT_PIIDS = {
+    5: {"name": "场景模式", "icon": "mdi:cog", "options": ["AI模式", "数码生态", "单口模式", "均衡模式"]},
+    6: {"name": "息屏时间", "icon": "mdi:monitor", "options": ["5分钟", "1分钟", "10分钟", "30分钟", "常亮"]},
+    13: {"name": "语言", "icon": "mdi:translate", "options": ["English", "中文"]},
+}
+
+# Derive option map from SELECT_PIIDS and PIID_DISPLAY (keep first match for duplicates)
+SELECT_OPTION_MAP = {}
+for piid, cfg in SELECT_PIIDS.items():
+    display = PIID_DISPLAY.get(piid, {})
+    option_map = {}
+    for k, v in display.items():
+        if v in cfg["options"] and v not in option_map:
+            option_map[v] = k
+    SELECT_OPTION_MAP[piid] = option_map
 
 # Device info
 DEVICE_INFO = {
