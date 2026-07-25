@@ -1,5 +1,50 @@
 # Release Notes
 
+## v1.0.8
+
+### BLE Server — 实时推送与配置管理
+
+#### 新增功能
+- **SSE 事件流**: Server-Sent Events 实时推送端口数据、状态、设置、协议变更至 Web 前端，替代 2s 轮询
+- **Web 配置页面**: `/config.html` 在线编辑 BLE/MQTT/Bemfa/Server 配置，保存后自动重启
+- **Xiaomi Cloud 登录**: 扫码登录小米账号，自动获取设备 Token 和 BLE Key
+- **连接质量工具提示**: 悬浮查看 BLE/MQTT/Bemfa 三路连接评分、解密率、连接时长、重连频率
+- **BLE 连接质量指标**: 后端持续评估解密成功率、推送间隔、重连频率、LNS 状态
+- **LTTB 降采样优化**: 列预提取 + 缓存边界值 + 去除冗余除法，2M→600 点 408ms
+- **配置持久化**: `config.yaml` 支持在线修改并持久化，日志等级变更同步写入
+
+#### 协议检测
+- **硬件协议码（PIID 17/18）**: 新增硬件协议码解析，支持 C1/C2（PIID 17）和 C3/A（PIID 18），与米家 App 一致
+- **启动顺序调整**: `_read_initial_settings()` 提前到 init_push 处理之前，确保硬件协议码在端口数据显示前就绪
+- **硬件码优先策略**: `estimate_protocol_number()` 优先使用硬件协议码（`hw_protocol`），无硬件码时降级为启发式推断
+- **零值保护**: PIID 17/18 刷新返回 0 时保留旧值，避免协议码被无效数据覆盖
+- **协议去抖**: `_proto_buf` 连续 3 次相同才确认协议变更，端口空闲时立即清空缓冲
+- **置信度系统**: 协议变更时置信度 0.90，5 分钟半衰期衰减至 0.40（下限）
+- **PD vs PPS 区分优化**: 高压段（≥12V）PD 档位匹配阈值放宽至 0.3V，降低线损导致的误判
+
+### Web UI
+
+- **SSE 驱动实时更新**: 桌面端增量 DOM 更新（`updatePortDOM`），手机端增量渲染（`applyPortUpdate`）
+- **重连自动同步**: SSE `onopen` 事件触发全量拉取，断连后自动恢复显示
+- **bfcache 支持**: `pagehide` 关闭 EventSource，`pageshow` 重建，页面返回无需重载
+- **配置页**: 新增配置管理页面，支持 BLE/MQTT/Bemfa/Server 参数修改
+- **小米云 Token 提取**: 配置页集成二维码扫码登录小米账号，自动获取设备参数
+- **响应式**: 适配桌面端和移动端新功能入口
+- **质量评分显示**: BLE 徽章悬浮查看连接质量评分
+
+### HA 集成
+
+#### 改进
+- **数据通道优化**: MQTT 主通道优先，HTTP 降级为回退，消除双重写入
+- **reauth 流程**: `async_step_reauth` 增加 `async_set_unique_id`，正确匹配已有配置条目
+- **时间函数选型**: `time.time()` 改为 `hass.loop.time()`，避免系统时钟调整导致可用性误判
+- **异常日志**: `_async_health_check` 中 JSON 解析异常从静默吞掉改为 `_LOGGER.warning`
+- **健康检查状态同步**: HTTP 健康检查成功时更新 `_last_status_time`，避免 MQTT 断线时错误标记为不可用
+
+### 测试
+
+- **总计 240+ 测试**: BLE Server + HA Integration 全部通过
+
 ## v1.0.7
 
 ### BLE Server — 充电记录与电量统计
