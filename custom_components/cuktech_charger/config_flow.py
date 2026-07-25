@@ -78,6 +78,9 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self, entry_data: dict[str, Any]
     ) -> FlowResult:
         """Handle re-authentication when the server URL changes."""
+        server_url = entry_data.get(CONF_SERVER_URL, DEFAULT_SERVER_URL)
+        unique_id = hashlib.md5(server_url.encode()).hexdigest()[:16]
+        await self.async_set_unique_id(f"cuktech_{unique_id}")
         return await self.async_step_reauth_confirm()
 
     async def async_step_reauth_confirm(

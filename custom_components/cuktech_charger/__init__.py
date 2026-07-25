@@ -4,7 +4,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import time
 from datetime import timedelta
 from typing import Any
 
@@ -80,7 +79,7 @@ class CuktechMQTTCoordinator:
         self._available = False
         self._mqtt_connected = False
         self._health_check_unsub = None
-        self._last_status_time: float = 0
+        self._last_status_time: float = -999  # init negative: lock.loop.time() - (-999) > 30 → not available at startup
         self._health_check_task = None
         self._health_failures = 0
         self._device_model: str = DEVICE_INFO["model"]
@@ -232,7 +231,7 @@ class CuktechMQTTCoordinator:
         )
         self._unsub.append(unsub)
 
-        self._last_status_time = time.time()
+        self._last_status_time = self.hass.loop.time()
 
         # Start HTTP health check as fallback
         self._health_check_unsub = async_track_time_interval(
@@ -309,7 +308,7 @@ class CuktechMQTTCoordinator:
             self._mqtt_connected = connected
             self._ble_connected = connected
             if self._mqtt_connected:
-                self._last_status_time = time.time()
+                self._last_status_time = self.hass.loop.time()
                 self._health_failures = 0
             # Update device info from BLE server
             info_changed = False
@@ -389,7 +388,7 @@ class CuktechMQTTCoordinator:
 
     def _update_availability(self) -> None:
         """Update availability based on MQTT status and HTTP health."""
-        http_recent = (time.time() - self._last_status_time) < 30
+        http_recent = (self.hass.loop.time() - self._last_status_time) < 30
         self._available = self._mqtt_connected or http_recent
 
     async def _async_health_check(self, _now) -> None:
@@ -400,7 +399,7 @@ class CuktechMQTTCoordinator:
             async with session.get(url, timeout=10) as resp:
                 if resp.status == 200:
                     was_available = self._available
-                    self._last_status_time = time.time()
+                    self._last_status_time = self.hass.loop.time()
                     self._health_failures = 0
                     self._update_availability()
                     if self._available and not was_available:
@@ -430,8 +429,8 @@ class CuktechMQTTCoordinator:
                             if info_changed:
                                 self.hass.async_create_task(self._async_update_device_registry())
                                 self._notify_callbacks()
-                        except Exception:
-                            pass
+                        except Exception as err:
+                            _LOGGER.warning("Failed to parse health check JSON response: %s", err)
                 else:
                     self._health_failures += 1
                     if self._available:
@@ -448,13 +447,12 @@ class CuktechMQTTCoordinator:
             self._available = self._mqtt_connected
 
     async def async_enable_ble(self, enable: bool) -> bool:
-        """Enable or disable BLE connection via MQTT + HTTP API."""
+        """Enable or disable BLE connection via MQTT (primary) + HTTP (fallback)."""
         async with self._ble_lock:
             self._ble_enabled = enable
             self._ble_pending = True
             self._notify_callbacks()
 
-            # 30 秒超时保护：防止网络异常时 switch 永远灰掉
             async def _clear_pending_after_delay() -> None:
                 await asyncio.sleep(30)
                 if self._ble_pending:
@@ -464,31 +462,35 @@ class CuktechMQTTCoordinator:
 
             timeout_task = self.hass.async_create_task(_clear_pending_after_delay())
 
+            success = False
+            # MQTT (primary channel - ESP32)
             try:
-                # MQTT (ESP32)
                 await mqtt.async_publish(
                     self.hass, f"{TOPIC_PREFIX}/ble",
                     json.dumps({"enabled": enable})
                 )
                 _LOGGER.info("BLE %s published via MQTT", "enable" if enable else "disable")
+                success = True
             except Exception as err:
                 _LOGGER.debug("MQTT BLE publish failed: %s", err)
 
-            try:
-                # HTTP (ble_server)
-                session = async_get_clientsession(self.hass)
-                url = f"{self.server_url}/api/enable"
-                async with session.post(url, json={"enabled": enable}, timeout=30) as resp:
-                    if resp.status == 200:
-                        _LOGGER.info("BLE connection %s via HTTP", "enabled" if enable else "disabled")
-            except Exception as err:
-                _LOGGER.debug("HTTP BLE control not available: %s", err)
-            finally:
-                self._ble_pending = False
-                self._notify_callbacks()
-                if not timeout_task.done():
-                    timeout_task.cancel()
-            return True
+            # HTTP (fallback - ble_server, for cases where ESP32 uses HTTP instead of MQTT)
+            if not success:
+                try:
+                    session = async_get_clientsession(self.hass)
+                    url = f"{self.server_url}/api/enable"
+                    async with session.post(url, json={"enabled": enable}, timeout=30) as resp:
+                        if resp.status == 200:
+                            _LOGGER.info("BLE connection %s via HTTP (fallback)", "enabled" if enable else "disabled")
+                            success = True
+                except Exception as err:
+                    _LOGGER.warning("HTTP BLE control also failed: %s", err)
+
+            self._ble_pending = False
+            self._notify_callbacks()
+            if not timeout_task.done():
+                timeout_task.cancel()
+            return success
 
     async def async_set_value(self, piid: int, value: Any) -> None:
         """Set a PIID value via MQTT."""
