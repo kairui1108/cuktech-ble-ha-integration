@@ -6,10 +6,11 @@ from typing import Any
 
 from homeassistant.components.number import NumberEntity, NumberMode
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from . import CuktechMQTTCoordinator
+from .base_entity import CuktechBaseEntity, CB_TYPE_SETTINGS
 from .const import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
@@ -34,10 +35,9 @@ async def async_setup_entry(
     async_add_entities(entities)
 
 
-class CuktechCountdown(NumberEntity):
+class CuktechCountdown(CuktechBaseEntity, NumberEntity):
     """Number entity for CUKTECH Charger countdown timers."""
 
-    _attr_has_entity_name = True
     _attr_native_min_value = 0
     _attr_native_max_value = 1440
     _attr_native_step = 1
@@ -53,34 +53,11 @@ class CuktechCountdown(NumberEntity):
         icon: str,
     ) -> None:
         """Initialize the number entity."""
-        self.coordinator = coord
-        self._entry = entry
         self._piid = piid
         self._attr_unique_id = f"{entry.entry_id}_countdown_{piid}"
         self._attr_name = name
         self._attr_icon = icon
-        coord.register_callback(self._update)
-
-    async def async_will_remove_from_hass(self) -> None:
-        """Unregister callback when removed."""
-        self.coordinator.unregister_callback(self._update)
-        await super().async_will_remove_from_hass()
-
-    @callback
-    def _update(self) -> None:
-        """Handle state update."""
-        if self.hass is not None:
-            self.async_write_ha_state()
-
-    @property
-    def device_info(self) -> dict[str, Any]:
-        """Return device info."""
-        return {"identifiers": {(DOMAIN, self._entry.entry_id)}, **self.coordinator.device_info}
-
-    @property
-    def available(self) -> bool:
-        """Return True if entity is available."""
-        return self.coordinator.available
+        super().__init__(coord, entry, CB_TYPE_SETTINGS)
 
     @property
     def native_value(self) -> float | None:

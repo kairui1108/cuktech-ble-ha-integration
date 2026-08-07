@@ -1,5 +1,39 @@
 # Release Notes
 
+## v1.0.9
+
+### BLE Server — SSE 稳定性、实时曲线与性能优化
+
+#### 新增功能
+- **桌面端实时功率曲线**: 端口详情弹窗新增 `⚡ 实时` 按钮，SSE `port_update` 驱动 500ms 去抖更新，右对齐填充实现曲线从右侧进入
+- **移动端实时功率曲线**: phone.html 组合图表改用 `phoneChartData` 时间戳缓冲区，x 轴显示 `HH:MM:SS` 标签，5 分钟滑动窗口（`PHONE_CHART_MAX=150`）
+- **静态文件预加载缓存**: 启动时扫描 `static/` 目录全部读入内存 + 预 gzip 压缩，运行时零磁盘 I/O、零 gzip 开销
+- **会话自动超时**: 5 分钟无操作自动清理 `XiaomiCloudClient`，QR 扫码完成后取消定时器，避免 session 泄漏
+
+#### 改进
+- **SSE 推送稳定性**: `SSEEmitter` 增加 `_pending_status` 机制，status 事件永不被队列淘汰；`MAX_QUEUE_SIZE` 64 → 128；添加 `threading.Lock` 并发保护
+- **BLE 连接健壮性**: 熔断器（20 次失败 → 300s 冷却），重连延迟 ±25% jitter 防冲突
+- **静态文件缓存头**: 设置 `Cache-Control`，浏览器 7 天强缓存
+- **长稳解密失败恢复与推送隔离**: 针对设备长时间充电后偶发的「连续解密失败 → 会话过期 → 重连」故障，完成以下稳定性优化：
+  - **根因修复（设备 it 计数器溢出）**: 设备推送帧仅携带 `it` 计数器的低 16 位，但加密 nonce 使用完整的 4 字节 `it`。原 `decrypt()` 假定 `it` 高 16 位恒为 0，当设备持续推送使 `it` 超过 65535（约连续运行 11~13 小时）后 nonce 失配，导致推送帧解密失败。修复为跟踪设备 `it` 高 16 位，通过低 16 位回绕进位重建完整 `it`，从根本上消除长时运行后的解密失败与会话过期重连
+  - **settings 刷新与推送隔离**: GET/SET 响应等待期间不再丢弃端口实时推送帧，而是重放回 `cmd_recv` 队列交由主循环处理，消除端口数据丢失与推送帧错位
+  - **解密失败快速恢复**: 连续解密失败阈值从 10 次降至 3 次，数据丢失窗口由约 10 秒缩短至约 3 秒，更快触发会话恢复
+  - **降低 settings 刷新频率**: `settings_refresh_interval` 由 20s 调整为 60s，降低主动 GET 吞掉设备推送帧的概率
+- **MQTT BLE 连接控制**: 修复 HA「BLE连接」开关通过 MQTT 控制断开/连接不生效的问题——新增订阅并处理消息，调用 `ble.start()` / `ble.request_stop()` 响应，与 Bemfa 命令同线程安全模式
+
+### HA Integration
+
+#### 改进
+- **Coordinator 重构**: MQTT coordinator 独立化，`_notify_callbacks` 异常隔离防止回调链断裂
+- **实体去重**: `_async_add_entities` 日志去重，避免重复注册警告
+- **BLE 超时清理**: `_clear_pending_after_delay` 任务管理，充电 session 完成后自动取消
+- **`async_will_remove_from_hass`**: 所有 Entity 添加 `super().async_will_remove_from_hass()` 调用
+
+### 测试
+
+- **总计 230 个测试**: BLE Server 全部通过
+- **测试覆盖**: SSEmitter 状态去重、静态文件缓存、实时曲线缓冲区、Xiaomi session 超时流程
+
 ## v1.0.8
 
 ### BLE Server — 实时推送与配置管理

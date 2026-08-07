@@ -25,8 +25,16 @@ STEP_USER_DATA_SCHEMA = vol.Schema(
 )
 
 
+def generate_unique_id(server_url: str) -> str:
+    """Generate a stable unique ID from the server URL."""
+    return f"cuktech_{hashlib.md5(server_url.encode()).hexdigest()[:16]}"
+
+
 async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str, str]:
-    """Validate the user input allows us to connect."""
+    """Validate the user input allows us to connect.
+
+    Returns a dict with "title" on success, raises ValueError on failure.
+    """
     server_url = data.get(CONF_SERVER_URL, DEFAULT_SERVER_URL)
     session = async_get_clientsession(hass)
     try:
@@ -54,17 +62,16 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         if user_input is not None:
             try:
-                info = await validate_input(self.hass, user_input)
-            except ValueError as err:
+                await validate_input(self.hass, user_input)
+            except ValueError:
                 errors["base"] = "cannot_connect"
             except Exception:
-                _LOGGER.exception("Unexpected exception")
+                _LOGGER.exception("Unexpected exception during setup")
                 errors["base"] = "unknown"
             else:
                 server_url = user_input.get(CONF_SERVER_URL, DEFAULT_SERVER_URL)
                 conf_name = user_input.get(CONF_NAME, "CUKTECH Charger")
-                unique_id = hashlib.md5(server_url.encode()).hexdigest()[:16]
-                await self.async_set_unique_id(f"cuktech_{unique_id}")
+                await self.async_set_unique_id(generate_unique_id(server_url))
                 self._abort_if_unique_id_configured()
                 return self.async_create_entry(title=conf_name, data=user_input)
 
@@ -79,8 +86,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     ) -> FlowResult:
         """Handle re-authentication when the server URL changes."""
         server_url = entry_data.get(CONF_SERVER_URL, DEFAULT_SERVER_URL)
-        unique_id = hashlib.md5(server_url.encode()).hexdigest()[:16]
-        await self.async_set_unique_id(f"cuktech_{unique_id}")
+        await self.async_set_unique_id(generate_unique_id(server_url))
         return await self.async_step_reauth_confirm()
 
     async def async_step_reauth_confirm(
@@ -92,10 +98,10 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             try:
                 await validate_input(self.hass, user_input)
-            except ValueError as err:
+            except ValueError:
                 errors["base"] = "cannot_connect"
             except Exception:
-                _LOGGER.exception("Unexpected exception")
+                _LOGGER.exception("Unexpected exception during reauth")
                 errors["base"] = "unknown"
             else:
                 entry = self.hass.config_entries.async_get_entry(self.context["entry_id"])

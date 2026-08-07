@@ -65,7 +65,6 @@ class CuktechChargeEvent(EventEntity):
         if event is None:
             return
         self._trigger_event("charge_end", event)
-        self.async_write_ha_state()
 
     @property
     def device_info(self) -> dict[str, Any]:

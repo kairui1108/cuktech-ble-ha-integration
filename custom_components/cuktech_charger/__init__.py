@@ -36,6 +36,10 @@ _LOGGER = logging.getLogger(__name__)
 PLATFORMS = [Platform.SENSOR, Platform.SWITCH, Platform.SELECT, Platform.BINARY_SENSOR, Platform.NUMBER, Platform.EVENT]
 HEALTH_CHECK_INTERVAL = timedelta(seconds=30)
 
+MQTT_RETRY_COUNT = 8
+MQTT_RETRY_BASE_DELAY = 1
+MQTT_RETRY_MAX_DELAY = 15
+
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up CUKTECH Charger from a config entry."""
@@ -75,11 +79,13 @@ class CuktechMQTTCoordinator:
         self._port_data: dict[str, dict[str, Any]] = {}
         self._settings: dict[str, Any] = {}
         self._callbacks: list = []
+        self._port_callbacks: list = []
+        self._settings_callbacks: list = []
         self._unsub: list = []
         self._available = False
         self._mqtt_connected = False
         self._health_check_unsub = None
-        self._last_status_time: float = -999  # init negative: lock.loop.time() - (-999) > 30 → not available at startup
+        self._last_status_time: float = -999
         self._health_check_task = None
         self._health_failures = 0
         self._device_model: str = DEVICE_INFO["model"]
@@ -88,6 +94,7 @@ class CuktechMQTTCoordinator:
         self._ble_enabled: bool = False
         self._ble_pending: bool = False
         self._ble_lock = asyncio.Lock()
+        self._ble_timeout_task: asyncio.Task | None = None
         self._charge_events: list[dict] = []
         self._charge_event_callbacks: list = []
 
@@ -111,16 +118,34 @@ class CuktechMQTTCoordinator:
         """Return True if a BLE connect/disconnect operation is in progress."""
         return self._ble_pending
 
+    # --- Callback registration ---
+
     def register_callback(self, cb) -> None:
-        """Register a callback for state updates."""
-        if len(self._callbacks) > 100:
-            _LOGGER.warning("Too many callbacks registered: %d", len(self._callbacks))
+        """Register a callback for all state updates."""
         self._callbacks.append(cb)
 
     def unregister_callback(self, cb) -> None:
-        """Unregister a callback."""
+        """Unregister a generic callback."""
         if cb in self._callbacks:
             self._callbacks.remove(cb)
+
+    def register_port_callback(self, cb) -> None:
+        """Register a callback for port data updates only."""
+        self._port_callbacks.append(cb)
+
+    def unregister_port_callback(self, cb) -> None:
+        """Unregister a port callback."""
+        if cb in self._port_callbacks:
+            self._port_callbacks.remove(cb)
+
+    def register_settings_callback(self, cb) -> None:
+        """Register a callback for settings data updates only."""
+        self._settings_callbacks.append(cb)
+
+    def unregister_settings_callback(self, cb) -> None:
+        """Unregister a settings callback."""
+        if cb in self._settings_callbacks:
+            self._settings_callbacks.remove(cb)
 
     def register_charge_event_callback(self, cb) -> None:
         """Register a callback for charge completion events."""
@@ -130,6 +155,25 @@ class CuktechMQTTCoordinator:
         """Unregister a charge event callback."""
         if cb in self._charge_event_callbacks:
             self._charge_event_callbacks.remove(cb)
+
+    # --- Internal notification methods ---
+
+    def _notify_callbacks(self, cbs: list | None = None) -> None:
+        """Notify all registered callbacks in a given list, or all if none given."""
+        targets = cbs if cbs is not None else self._callbacks
+        for cb in list(targets):
+            try:
+                cb()
+            except Exception:
+                _LOGGER.exception("Callback error")
+
+    def _notify_all(self) -> None:
+        """Notify all callback lists (generic + port + settings)."""
+        self._notify_callbacks(self._callbacks)
+        self._notify_callbacks(self._port_callbacks)
+        self._notify_callbacks(self._settings_callbacks)
+
+    # --- Properties ---
 
     @property
     def last_charge_event(self) -> dict | None:
@@ -193,22 +237,11 @@ class CuktechMQTTCoordinator:
             "sw_version": self._firmware_version,
         }
 
+    # --- Lifecycle ---
+
     async def async_setup(self) -> None:
         """Set up MQTT subscriptions."""
-        base_delay = 1
-        max_delay = 30
-        for attempt in range(10):
-            try:
-                await mqtt.async_publish(self.hass, TOPIC_PROBE, "ready")
-                break
-            except Exception as err:
-                delay = min(base_delay * (2 ** attempt), max_delay)
-                if attempt < 9:
-                    _LOGGER.debug("MQTT not ready, attempt %d/%d, retrying in %ds: %s", attempt + 1, 10, delay, err)
-                    await asyncio.sleep(delay)
-                else:
-                    _LOGGER.error("MQTT not ready after 10 attempts")
-                    raise ConfigEntryNotReady("MQTT not available")
+        await self._async_wait_mqtt_ready()
 
         for port_name in ("c1", "c2", "c3", "a"):
             unsub = await mqtt.async_subscribe(
@@ -248,6 +281,11 @@ class CuktechMQTTCoordinator:
 
     async def async_unload(self) -> None:
         """Unload MQTT subscriptions."""
+        # Cancel any in-flight BLE timeout task
+        if self._ble_timeout_task is not None and not self._ble_timeout_task.done():
+            self._ble_timeout_task.cancel()
+            self._ble_timeout_task = None
+
         for unsub in self._unsub:
             unsub()
         self._unsub.clear()
@@ -256,13 +294,69 @@ class CuktechMQTTCoordinator:
         self._health_check_unsub = None
         _LOGGER.info("CUKTECH Charger MQTT coordinator unloaded")
 
-    def _notify_callbacks(self) -> None:
-        """Notify all registered callbacks."""
-        for cb in list(self._callbacks):
+    async def _async_wait_mqtt_ready(self) -> None:
+        """Wait for MQTT to become available with exponential backoff."""
+        for attempt in range(MQTT_RETRY_COUNT):
             try:
-                cb()
+                await mqtt.async_publish(self.hass, TOPIC_PROBE, "ready")
+                return
             except Exception as err:
-                _LOGGER.exception("Callback error: %s", err)
+                delay = min(MQTT_RETRY_BASE_DELAY * (2 ** attempt), MQTT_RETRY_MAX_DELAY)
+                if attempt < MQTT_RETRY_COUNT - 1:
+                    _LOGGER.debug(
+                        "MQTT not ready, attempt %d/%d, retrying in %ds: %s",
+                        attempt + 1, MQTT_RETRY_COUNT, delay, err,
+                    )
+                    await asyncio.sleep(delay)
+                else:
+                    _LOGGER.error("MQTT not ready after %d attempts", MQTT_RETRY_COUNT)
+                    raise ConfigEntryNotReady("MQTT not available")
+
+    # --- Device info synchronization (shared logic) ---
+
+    def _sync_device_info_from_payload(self, payload: dict) -> bool:
+        """Update device model/firmware from a payload dict. Returns True if any changed."""
+        changed = False
+        if "device_model" in payload and payload["device_model"]:
+            if self._device_model != payload["device_model"]:
+                self._device_model = payload["device_model"]
+                changed = True
+        if "firmware_version" in payload:
+            new_fw = payload.get("firmware_version", "")
+            if self._firmware_version != new_fw:
+                self._firmware_version = new_fw
+                changed = True
+        return changed
+
+    def _sync_ble_state(self, connected: bool) -> bool:
+        """Sync BLE state from actual connection. Returns True if enabled state changed."""
+        prev_enabled = self._ble_enabled
+        self._ble_connected = connected
+        if connected and not self._ble_enabled:
+            self._ble_enabled = True
+            _LOGGER.info("BLE auto-reconnected, syncing switch state")
+        elif not connected and self._ble_enabled:
+            self._ble_enabled = False
+            _LOGGER.info("BLE disconnected, syncing switch state")
+        return self._ble_enabled != prev_enabled
+
+    def _clear_pending_if_confirmed(self) -> None:
+        """Clear BLE pending if actual state matches user intent."""
+        if self._ble_pending and self._ble_connected == self._ble_enabled:
+            self._ble_pending = False
+            _LOGGER.debug("BLE state confirmed, cleared pending")
+
+    def _log_health_failure(self, message: str, err: str = "") -> None:
+        """Log health check failure with throttling."""
+        self._health_failures += 1
+        if self._available:
+            _LOGGER.warning("%s%s", message, f": {err}" if err else "")
+        elif self._health_failures % 10 == 0:
+            _LOGGER.warning(
+                "%s (failure #%d)%s", message, self._health_failures, f": {err}" if err else ""
+            )
+
+    # --- MQTT message handlers ---
 
     @callback
     def _on_port_message(self, msg: Any) -> None:
@@ -277,7 +371,7 @@ class CuktechMQTTCoordinator:
                     port_name, payload.get("voltage"), payload.get("current"),
                     payload.get("power"), payload.get("protocol"))
                 self._port_data[str(piid)] = payload
-                self._notify_callbacks()
+                self._notify_callbacks(self._port_callbacks)
         except json.JSONDecodeError as err:
             _LOGGER.debug("Port JSON parse error: %s", err)
         except Exception as err:
@@ -290,7 +384,7 @@ class CuktechMQTTCoordinator:
             payload = json.loads(msg.payload)
             _LOGGER.debug("Settings updated: %s", list(payload.keys()))
             self._settings = payload
-            self._notify_callbacks()
+            self._notify_callbacks(self._settings_callbacks)
         except json.JSONDecodeError as err:
             _LOGGER.debug("Settings JSON parse error: %s", err)
         except Exception as err:
@@ -302,47 +396,30 @@ class CuktechMQTTCoordinator:
         try:
             payload = json.loads(msg.payload)
             was_available = self._available
-            connected = payload.get("connected", False)
             prev_ble_connected = self._ble_connected
-            ble_changed = prev_ble_connected != connected
+            connected = payload.get("connected", False)
+
             self._mqtt_connected = connected
-            self._ble_connected = connected
-            if self._mqtt_connected:
+            if connected:
                 self._last_status_time = self.hass.loop.time()
                 self._health_failures = 0
-            # Update device info from BLE server
-            info_changed = False
-            if "device_model" in payload and payload["device_model"]:
-                if self._device_model != payload["device_model"]:
-                    self._device_model = payload["device_model"]
-                    info_changed = True
-            if "firmware_version" in payload:
-                new_fw = payload.get("firmware_version", "")
-                if self._firmware_version != new_fw:
-                    self._firmware_version = new_fw
-                    info_changed = True
+
+            # Sync device info & BLE state from payload
+            info_changed = self._sync_device_info_from_payload(payload)
+            self._sync_ble_state(connected)
+            self._clear_pending_if_confirmed()
             self._update_availability()
-            # 同步用户意图与 BLE 实际状态（仅跟随 MQTT 状态变化，不强制覆盖）
-            ble_enabled_changed = False
-            if not prev_ble_connected and self._ble_connected and not self._ble_enabled:
-                self._ble_enabled = True
-                ble_enabled_changed = True
-                _LOGGER.info("BLE auto-reconnected, syncing switch state")
-            elif prev_ble_connected and not self._ble_connected and self._ble_enabled:
-                self._ble_enabled = False
-                ble_enabled_changed = True
-                _LOGGER.info("BLE disconnected, syncing switch state")
-            # 如果 BLE 实际状态与用户意图一致，清除 pending
-            if self._ble_pending and self._ble_connected == self._ble_enabled:
-                self._ble_pending = False
-                _LOGGER.debug("BLE state confirmed, cleared pending")
+
+            # Log availability transitions
             if self._available and not was_available:
                 _LOGGER.info("BLE server is now available (MQTT)")
             elif not self._available and was_available:
                 _LOGGER.warning("BLE server disconnected (MQTT)")
-            if info_changed or ble_changed or ble_enabled_changed:
+
+            if info_changed or prev_ble_connected != connected:
                 self.hass.async_create_task(self._async_update_device_registry())
-                self._notify_callbacks()
+
+            self._notify_callbacks(self._callbacks)
             _LOGGER.debug("Status message: %s", payload)
         except json.JSONDecodeError as err:
             _LOGGER.debug("Status JSON parse error: %s", err)
@@ -363,15 +440,13 @@ class CuktechMQTTCoordinator:
             _LOGGER.info("Charge event: port=%s energy=%.1fWh duration=%ds",
                          payload.get("port"), payload.get("energy_wh", 0),
                          payload.get("duration_sec", 0))
-            for cb in list(self._charge_event_callbacks):
-                try:
-                    cb()
-                except Exception as err:
-                    _LOGGER.exception("Charge event callback error: %s", err)
+            self._notify_callbacks(self._charge_event_callbacks)
         except json.JSONDecodeError as err:
             _LOGGER.debug("Charge event JSON parse error: %s", err)
         except Exception as err:
             _LOGGER.exception("Charge event error: %s", err)
+
+    # --- Device registry ---
 
     async def _async_update_device_registry(self) -> None:
         """Update device registry with latest device info (firmware, model)."""
@@ -385,6 +460,8 @@ class CuktechMQTTCoordinator:
                 sw_version=self._firmware_version or None,
                 model=self._device_model or None,
             )
+
+    # --- Availability ---
 
     def _update_availability(self) -> None:
         """Update availability based on MQTT status and HTTP health."""
@@ -406,61 +483,54 @@ class CuktechMQTTCoordinator:
                         _LOGGER.info("BLE server is now available (HTTP)")
                     # Fallback: also read connection status and device info from HTTP if MQTT not connected
                     if not self._mqtt_connected:
-                        try:
-                            data = await resp.json()
-                            info_changed = False
-                            model = data.get("device_model", "")
-                            fw = data.get("firmware_version", "")
-                            ble_conn = data.get("connected", False)
-                            if model and self._device_model != model:
-                                self._device_model = model
-                                info_changed = True
-                            if fw and self._firmware_version != fw:
-                                self._firmware_version = fw
-                                info_changed = True
-                            if self._ble_connected != ble_conn:
-                                self._ble_connected = ble_conn
-                                # 首次加载或 MQTT 断连时，同步开关状态到实际连接状态
-                                if ble_conn and not self._ble_enabled:
-                                    self._ble_enabled = True
-                                elif not ble_conn and self._ble_enabled:
-                                    self._ble_enabled = False
-                                self._notify_callbacks()
-                            if info_changed:
-                                self.hass.async_create_task(self._async_update_device_registry())
-                                self._notify_callbacks()
-                        except Exception as err:
-                            _LOGGER.warning("Failed to parse health check JSON response: %s", err)
+                        await self._async_health_check_parse_body(resp)
                 else:
-                    self._health_failures += 1
-                    if self._available:
-                        _LOGGER.warning("BLE server returned HTTP status %d (failure #%d)", resp.status, self._health_failures)
-                    elif self._health_failures % 10 == 0:
-                        _LOGGER.warning("BLE server HTTP check failed %d times", self._health_failures)
+                    self._log_health_failure(
+                        f"BLE server returned HTTP status {resp.status}"
+                    )
                     self._available = self._mqtt_connected
         except Exception as err:
-            self._health_failures += 1
-            if self._available:
-                _LOGGER.warning("BLE server HTTP health check failed: %s", err)
-            elif self._health_failures % 10 == 0:
-                _LOGGER.warning("BLE server HTTP check failed %d times: %s", self._health_failures, err)
+            self._log_health_failure("BLE server HTTP health check failed", str(err))
             self._available = self._mqtt_connected
+
+    async def _async_health_check_parse_body(self, resp) -> None:
+        """Parse health check JSON body and sync device info."""
+        try:
+            data = await resp.json()
+            info_changed = self._sync_device_info_from_payload(data)
+            ble_conn = data.get("connected", False)
+            if self._ble_connected != ble_conn:
+                self._sync_ble_state(ble_conn)
+                self._clear_pending_if_confirmed()
+                self._notify_callbacks(self._callbacks)
+            if info_changed:
+                self.hass.async_create_task(self._async_update_device_registry())
+                self._notify_callbacks(self._callbacks)
+        except Exception as err:
+            _LOGGER.warning("Failed to parse health check JSON response: %s", err)
+
+    # --- BLE control ---
 
     async def async_enable_ble(self, enable: bool) -> bool:
         """Enable or disable BLE connection via MQTT (primary) + HTTP (fallback)."""
         async with self._ble_lock:
+            # Cancel any previous pending timeout
+            if self._ble_timeout_task is not None and not self._ble_timeout_task.done():
+                self._ble_timeout_task.cancel()
+                self._ble_timeout_task = None
+
             self._ble_enabled = enable
             self._ble_pending = True
-            self._notify_callbacks()
+            self._notify_callbacks(self._callbacks)
 
             async def _clear_pending_after_delay() -> None:
                 await asyncio.sleep(30)
                 if self._ble_pending:
                     self._ble_pending = False
-                    self._notify_callbacks()
+                    self._notify_callbacks(self._callbacks)
                     _LOGGER.warning("BLE operation timed out, clearing pending state")
 
-            timeout_task = self.hass.async_create_task(_clear_pending_after_delay())
+            self._ble_timeout_task = self.hass.async_create_task(_clear_pending_after_delay())
 
             success = False
             # MQTT (primary channel - ESP32)
@@ -474,7 +544,7 @@ class CuktechMQTTCoordinator:
             except Exception as err:
                 _LOGGER.debug("MQTT BLE publish failed: %s", err)
 
-            # HTTP (fallback - ble_server, for cases where ESP32 uses HTTP instead of MQTT)
+            # HTTP (fallback - ble_server)
             if not success:
                 try:
                     session = async_get_clientsession(self.hass)
@@ -487,9 +557,10 @@ class CuktechMQTTCoordinator:
                     _LOGGER.warning("HTTP BLE control also failed: %s", err)
 
             self._ble_pending = False
-            self._notify_callbacks()
-            if not timeout_task.done():
-                timeout_task.cancel()
+            self._notify_callbacks(self._callbacks)
+            if self._ble_timeout_task is not None and not self._ble_timeout_task.done():
+                self._ble_timeout_task.cancel()
+            self._ble_timeout_task = None
             return success
 
     async def async_set_value(self, piid: int, value: Any) -> None:
@@ -520,4 +591,3 @@ class CuktechMQTTCoordinator:
             switches[port][protocol] = on
             value = self._encode_protocol_extend(switches)
             await self.async_set_value(21, value)
-

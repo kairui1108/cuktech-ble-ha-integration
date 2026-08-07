@@ -6,11 +6,13 @@ from typing import Any
 
 from homeassistant.components.switch import SwitchDeviceClass, SwitchEntity
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from . import CuktechMQTTCoordinator
+from .base_entity import CuktechBaseEntity, CB_TYPE_ALL, CB_TYPE_SETTINGS
 from .const import DOMAIN
+
 _LOGGER = logging.getLogger(__name__)
 
 # 各端口支持的协议开关定义
@@ -60,40 +62,21 @@ async def async_setup_entry(
     async_add_entities(entities)
 
 
-class CuktechConnectionSwitch(SwitchEntity):
+class CuktechConnectionSwitch(CuktechBaseEntity, SwitchEntity):
     """Switch to control BLE connection (enable/disable)."""
 
-    _attr_has_entity_name = True
     _attr_name = "连接控制"
     _attr_icon = "mdi:bluetooth-connect"
 
     def __init__(self, coord: CuktechMQTTCoordinator, entry: ConfigEntry) -> None:
         """Initialize the switch."""
-        self.coordinator = coord
-        self._entry = entry
         self._attr_unique_id = f"{entry.entry_id}_ble_control"
-        coord.register_callback(self._update)
-
-    async def async_will_remove_from_hass(self) -> None:
-        """Unregister callback when removed."""
-        self.coordinator.unregister_callback(self._update)
-        await super().async_will_remove_from_hass()
-
-    @callback
-    def _update(self) -> None:
-        """Handle state update."""
-        if self.hass is not None:
-            self.async_write_ha_state()
-
-    @property
-    def device_info(self) -> dict[str, Any]:
-        """Return device info."""
-        return {"identifiers": {(DOMAIN, self._entry.entry_id)}, **self.coordinator.device_info}
+        super().__init__(coord, entry, CB_TYPE_ALL)
 
     @property
     def available(self) -> bool:
         """Return True if entity is available."""
-        return self.coordinator.available and not self.coordinator.ble_pending
+        return self.coordinator.available
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
@@ -114,10 +97,9 @@ class CuktechConnectionSwitch(SwitchEntity):
         await self.coordinator.async_enable_ble(False)
 
 
-class CuktechSettingSwitch(SwitchEntity):
+class CuktechSettingSwitch(CuktechBaseEntity, SwitchEntity):
     """Switch for CUKTECH Charger settings."""
 
-    _attr_has_entity_name = True
     _attr_device_class = SwitchDeviceClass.SWITCH
 
     def __init__(
@@ -129,34 +111,11 @@ class CuktechSettingSwitch(SwitchEntity):
         icon: str,
     ) -> None:
         """Initialize the switch."""
-        self.coordinator = coord
-        self._entry = entry
         self._piid = piid
         self._attr_unique_id = f"{entry.entry_id}_switch_{piid}"
         self._attr_name = name
         self._attr_icon = icon
-        coord.register_callback(self._update)
-
-    async def async_will_remove_from_hass(self) -> None:
-        """Unregister callback when removed."""
-        self.coordinator.unregister_callback(self._update)
-        await super().async_will_remove_from_hass()
-
-    @callback
-    def _update(self) -> None:
-        """Handle state update."""
-        if self.hass is not None:
-            self.async_write_ha_state()
-
-    @property
-    def device_info(self) -> dict[str, Any]:
-        """Return device info."""
-        return {"identifiers": {(DOMAIN, self._entry.entry_id)}, **self.coordinator.device_info}
-
-    @property
-    def available(self) -> bool:
-        """Return True if entity is available."""
-        return self.coordinator.available
+        super().__init__(coord, entry, CB_TYPE_SETTINGS)
 
     @property
     def is_on(self) -> bool | None:
@@ -175,10 +134,9 @@ class CuktechSettingSwitch(SwitchEntity):
         await self.coordinator.async_set_value(self._piid, 0)
 
 
-class CuktechPortSwitch(SwitchEntity):
+class CuktechPortSwitch(CuktechBaseEntity, SwitchEntity):
     """Switch for CUKTECH Charger ports."""
 
-    _attr_has_entity_name = True
     _attr_device_class = SwitchDeviceClass.OUTLET
 
     def __init__(
@@ -191,35 +149,12 @@ class CuktechPortSwitch(SwitchEntity):
         bit: int,
     ) -> None:
         """Initialize the switch."""
-        self.coordinator = coord
-        self._entry = entry
         self._port = port
         self._bit = bit
         self._attr_unique_id = f"{entry.entry_id}_port_switch_{port}"
         self._attr_name = name
         self._attr_icon = icon
-        coord.register_callback(self._update)
-
-    async def async_will_remove_from_hass(self) -> None:
-        """Unregister callback when removed."""
-        self.coordinator.unregister_callback(self._update)
-        await super().async_will_remove_from_hass()
-
-    @callback
-    def _update(self) -> None:
-        """Handle state update."""
-        if self.hass is not None:
-            self.async_write_ha_state()
-
-    @property
-    def device_info(self) -> dict[str, Any]:
-        """Return device info."""
-        return {"identifiers": {(DOMAIN, self._entry.entry_id)}, **self.coordinator.device_info}
-
-    @property
-    def available(self) -> bool:
-        """Return True if entity is available."""
-        return self.coordinator.available
+        super().__init__(coord, entry, CB_TYPE_SETTINGS)
 
     @property
     def is_on(self) -> bool | None:
@@ -240,10 +175,9 @@ class CuktechPortSwitch(SwitchEntity):
         await self.coordinator.async_port_control(self._port, "off")
 
 
-class CuktechProtocolSwitch(SwitchEntity):
+class CuktechProtocolSwitch(CuktechBaseEntity, SwitchEntity):
     """Switch for individual protocol on a CUKTECH Charger port (PIID 21)."""
 
-    _attr_has_entity_name = True
     _attr_device_class = SwitchDeviceClass.SWITCH
 
     def __init__(
@@ -255,35 +189,12 @@ class CuktechProtocolSwitch(SwitchEntity):
         name: str,
     ) -> None:
         """Initialize the protocol switch."""
-        self.coordinator = coord
-        self._entry = entry
         self._port = port
         self._protocol = protocol
         self._attr_unique_id = f"{entry.entry_id}_protocol_{port}_{protocol}"
         self._attr_name = name
         self._attr_icon = "mdi:power-plug-outline"
-        coord.register_callback(self._update)
-
-    async def async_will_remove_from_hass(self) -> None:
-        """Unregister callback when removed."""
-        self.coordinator.unregister_callback(self._update)
-        await super().async_will_remove_from_hass()
-
-    @callback
-    def _update(self) -> None:
-        """Handle state update."""
-        if self.hass is not None:
-            self.async_write_ha_state()
-
-    @property
-    def device_info(self) -> dict[str, Any]:
-        """Return device info."""
-        return {"identifiers": {(DOMAIN, self._entry.entry_id)}, **self.coordinator.device_info}
-
-    @property
-    def available(self) -> bool:
-        """Return True if entity is available."""
-        return self.coordinator.available
+        super().__init__(coord, entry, CB_TYPE_SETTINGS)
 
     @property
     def is_on(self) -> bool | None:
@@ -295,7 +206,7 @@ class CuktechProtocolSwitch(SwitchEntity):
         port_data = switches.get(self._port)
         if port_data is None:
             return None
-        if self._protocol == 'pps' and port_data.get('pd') is False:
+        if self._protocol == "pps" and port_data.get("pd") is False:
             return False
         return port_data.get(self._protocol)
 
